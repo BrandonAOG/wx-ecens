@@ -1057,8 +1057,12 @@ def normalise(f: "Fields", fhr: int = 0) -> "Fields":
         _, LAT = np.meshgrid(f.lon, f.lat)
         f["absv500"] = rel_vort(f["u500"], f["v500"], f.lon, f.lat) + 2 * 7.2921e-5 * np.sin(np.radians(LAT))
     if accum_from_zero:
-        if src == "ecmwf_opendata":                              # ECMWF tp is metres; CMC/ICON are mm
-            for k in [k for k in f if k.startswith("tp_acc")]:
+        # Units: ECMWF IFS (deterministic and ENS) publish tp in metres; CMC, ICON and AIFS
+        # in mm. Detect rather than assume: a run-total in mm exceeds 3 somewhere in any
+        # domain this size, a total in metres never does.
+        for k in [k for k in f if k.startswith("tp_acc")]:
+            mx = np.nanmax(f[k]) if np.isfinite(f[k]).any() else 0.0
+            if 0 < mx < 3.0:
                 f[k] = f[k] * 1000.0
         if "tp_acc" in f:
             prev = f.get("tp_acc_m6", np.zeros_like(f["tp_acc"]))
