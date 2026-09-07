@@ -344,16 +344,19 @@ def _index_select(index_url: str, session, want, retries: int = 3):
     if text is None:
         raise RuntimeError(f"index unavailable: {index_url}")
     entries = [_json.loads(line) for line in text.splitlines() if line.strip()]
+    # some models publish equivalents under other names: geopotential z (m²/s²) for height gh,
+    # total column water tcw for tcwv. normalise() converts them after loading.
+    ALT = {"gh": ["gh", "z"], "tcwv": ["tcwv", "tcw"], "msl": ["msl", "prmsl"]}
     found, ranges = set(), []
-    for e in entries:
-        p, lev = e.get("param"), e.get("levelist")
-        for wp, wl in want:
-            if p == wp and (wl is None or str(lev) == str(wl)):
-                ranges.append((int(e["_offset"]), int(e["_length"]))); found.add((wp, wl))
+    for wp, wl in want:
+        for cand in ALT.get(wp, [wp]):
+            hits = [e for e in entries if e.get("param") == cand and (wl is None or str(e.get("levelist")) == str(wl))]
+            if hits:
+                ranges += [(int(e["_offset"]), int(e["_length"])) for e in hits]; found.add((wp, wl)); break
     missing = [w for w in want if w not in found]
     if missing:
         present = sorted({f"{e.get('param')}@{e.get('levelist', e.get('levtype'))}" for e in entries})
-        log.warning("index %s lacks %s; has: %s", index_url.rsplit("/", 1)[-1], missing, " ".join(present[:60]))
+        log.warning("index %s lacks %s; has: %s", index_url.rsplit("/", 1)[-1], missing, " ".join(present))
     return ranges
 
 
@@ -867,7 +870,7 @@ def normalise(f: "Fields", fhr: int = 0) -> "Fields":
     src = MODEL["source"]
     accum_from_zero = src in ("ecmwf_opendata", "cmc", "icon")
     # ---- name aliases (any tag suffix)
-    alias = {"msl": "prmsl", "tcwv": "pwat", "tciwv": "pwat", "sde": "snod", "z": "gh",
+    alias = {"msl": "prmsl", "tcwv": "pwat", "tciwv": "pwat", "tcw": "pwat", "sde": "snod", "z": "gh",
              # DWD local names that eccodes passes through verbatim
              "TQV": "pwat", "T_G": "t_sfc", "CAPE_ML": "cape", "H_SNOW": "snod", "FR_LAND": "lsm", "PMSL": "prmsl",
              "TOT_PREC": "tp", "T_2M": "t2m", "U_10M": "u10", "V_10M": "v10", "RELHUM": "r", "FI": "z"}
