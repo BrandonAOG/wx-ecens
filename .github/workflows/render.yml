@@ -91,7 +91,8 @@ jobs:
 
   assemble:
     needs: [check, render]
-    if: needs.check.outputs.needs_render == 'true'
+    # run even if some slices failed: the manifest only lists hours that have images
+    if: always() && needs.check.outputs.needs_render == 'true' && needs.render.result != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -111,6 +112,7 @@ jobs:
           pattern: images-*
           path: site/images
           merge-multiple: true
+        continue-on-error: true
       - name: Write manifests
         env:
           RUNS: ${{ needs.check.outputs.runs }}
