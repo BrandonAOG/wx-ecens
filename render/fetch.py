@@ -326,9 +326,93 @@ def ecmwf_model_name() -> str:
     return "aifs-ens" if MODEL["source"] == "ecmwf_aifs_ens" else "ifs"
 
 
+def _index_select(index_url: str, session, want, retries: int = 3):
+    """Parse an ECMWF open-data .index (JSON lines) and return (offset, length)
+    for entries matching any of `want` = [(param, levelist or None)]. Logs the
+    parameters present when a wanted one is missing."""
+    import json as _json
+    text = None
+    for attempt in range(retries):
+        try:
+            r = session.get(index_url, timeout=120)
+            if r.status_code == 200:
+                text = r.text; break
+            log.info("index %s -> HTTP %s", index_url.rsplit("/", 1)[-1], r.status_code)
+        except requests.RequestException as e:
+            log.info("index fetch failed: %s", str(e)[:80])
+        time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
+    if text is None:
+        raise RuntimeError(f"index unavailable: {index_url}")
+    entries = [_json.loads(line) for line in text.splitlines() if line.strip()]
+    found, ranges = set(), []
+    for e in entries:
+        p, lev = e.get("param"), e.get("levelist")
+        for wp, wl in want:
+            if p == wp and (wl is None or str(lev) == str(wl)):
+                ranges.append((int(e["_offset"]), int(e["_length"]))); found.add((wp, wl))
+    missing = [w for w in want if w not in found]
+    if missing:
+        present = sorted({f"{e.get('param')}@{e.get('levelist', e.get('levtype'))}" for e in entries})
+        log.warning("index %s lacks %s; has: %s", index_url.rsplit("/", 1)[-1], missing, " ".join(present[:60]))
+    return ranges
+
+
+def _range_download(url: str, ranges, out, session, retries: int = 4):
+    """Fetch byte ranges from url and append to file object `out`. Ranges are
+    merged into contiguous blocks to keep the request count low."""
+    ranges = sorted(ranges)
+    blocks = []
+    for off, ln in ranges:
+        if blocks and off <= blocks[-1][1]:
+            blocks[-1][1] = max(blocks[-1][1], off + ln)
+        else:
+            blocks.append([off, off + ln])
+    for a, b in blocks:
+        for attempt in range(retries):
+            try:
+                r = session.get(url, headers={"Range": f"bytes={a}-{b - 1}"}, timeout=300)
+                if r.status_code in (200, 206):
+                    out.write(r.content); break
+                log.info("range %s -> HTTP %s", url.rsplit("/", 1)[-1], r.status_code)
+            except requests.RequestException as e:
+                log.info("range fetch failed: %s", str(e)[:80])
+            time.sleep(BACKOFF[min(attempt, len(BACKOFF) - 1)])
+        else:
+            raise RuntimeError(f"range download failed: {url}")
+
+
+def download_ecmwf_ens_direct(run: dt.datetime, step: int, fields, dest: Path, session: requests.Session | None = None) -> Path:
+    """AIFS-ENS layout: separate -enfo-cf (control) and -enfo-pf (perturbed)
+    files per step. Select fields via the .index files and range-download."""
+    session = session or requests.Session()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and dest.stat().st_size > 1000:
+        return dest
+    base = ECMWF_ENS_FILE.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), step=step, model=ecmwf_model_name())
+    want = [(p, lev) for p, lev in fields if not (p == "tp" and step == 0)]
+    tmp = dest.with_suffix(".part")
+    total = 0
+    with open(tmp, "wb") as out:
+        for kind in ("cf", "pf"):
+            grib = base.replace("-enfo-ef.grib2", f"-enfo-{kind}.grib2")
+            ranges = _index_select(grib[:-6] + ".index", session, want)
+            if not ranges:
+                continue
+            _range_download(grib, ranges, out, session)
+            total += len(ranges)
+    if total == 0:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"no matching fields in AIFS-ENS index for step {step}")
+    tmp.rename(dest)
+    log.info("AIFS-ENS step %d: %d fields via range requests", step, total)
+    return dest
+
+
 def download_ecmwf_ens(run: dt.datetime, step: int, fields, dest: Path, retries: int = 4) -> Path:
     """All 51 members (control + perturbed) of the listed fields for one step,
     byte-ranged out of the enfo file via the .index."""
+    if MODEL["source"] == "ecmwf_aifs_ens":
+        return download_ecmwf_ens_direct(run, step, fields, dest)
     from ecmwf.opendata import Client
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 1000:
