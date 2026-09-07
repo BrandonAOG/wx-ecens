@@ -12,6 +12,8 @@ import logging
 import os
 import re
 import time
+
+os.environ.setdefault("TQDM_DISABLE", "1")          # no per-file progress bars from the ECMWF client
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -69,7 +71,24 @@ def latest_available_run(now: dt.datetime | None = None,
             if run_max_hour(cand, session) is not None:
                 return cand
             log.info("%s %s not complete yet", MODEL["name"], cand.strftime("%Y%m%d %HZ"))
+        if MODEL["source"].startswith("ecmwf"):
+            ecmwf_explain(now, session)
         raise RuntimeError(f"No complete {MODEL['name']} run found in the last 48 h")
+
+
+def ecmwf_explain(now, session):
+    """When an ECMWF model can't be found, list what the open-data server
+    actually has for the most recent cycle so the layout can be corrected."""
+    cand = next(_candidate_cycles(now))
+    ymd, hh = cand.strftime("%Y%m%d"), cand.strftime("%H")
+    for url in [f"https://data.ecmwf.int/forecasts/{ymd}/{hh}z/",
+                f"https://data.ecmwf.int/forecasts/{ymd}/{hh}z/{ecmwf_model_name()}/",
+                f"https://data.ecmwf.int/forecasts/{ymd}/{hh}z/{ecmwf_model_name()}/0p25/",
+                f"https://data.ecmwf.int/forecasts/{ymd}/{hh}z/{ecmwf_model_name()}/0p25/enfo/"]:
+        entries = _listing(session, url, retries=1)
+        files = [e for e in entries if not e.endswith("/")]
+        log.info("ECMWF listing %s -> dirs %s, %d files%s", url, [e for e in entries if e.endswith("/")][:12], len(files),
+                 (" e.g. " + " ".join(files[:4])) if files else "")
     for cand in _candidate_cycles(now):
         url = NOMADS_IDX.format(ymd=cand.strftime("%Y%m%d"), hh=cand.strftime("%H"))
         try:
@@ -92,7 +111,9 @@ def _probe_url(run: dt.datetime, step: int, session=None) -> str | None:
     if src == "gefs":
         return GEFS_IDX.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), mem=MODEL["members"][-1], fhr=step)
     if src in ("ecmwf_ens", "ecmwf_aifs_ens"):
-        return ECMWF_ENS_FILE.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), step=step, model=ecmwf_model_name())
+        url = ECMWF_ENS_FILE.format(ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), step=step, model=ecmwf_model_name())
+        # AIFS-ENS publishes control and perturbed members as separate files (-cf / -pf); IFS ENS combines them (-ef)
+        return url.replace("-enfo-ef.grib2", "-enfo-cf.grib2") if src == "ecmwf_aifs_ens" else url
     if src == "aigefs":
         return GEFS_IDX.replace("/gens/prod/gefs.", "/aigefs/prod/aigefs.").format(
             ymd=run.strftime("%Y%m%d"), hh=run.strftime("%H"), mem=MODEL["members"][-1], fhr=step)
@@ -117,7 +138,7 @@ def run_max_hour(run: dt.datetime, session: requests.Session | None = None) -> i
             r = session.get(url, timeout=30, allow_redirects=True, stream=True); r.close()
             if r.status_code == 200:
                 return last
-            log.info("probe %s -> HTTP %s", url.rsplit("/", 1)[-1], r.status_code)
+            log.info("probe %s -> HTTP %s", url, r.status_code)
         except requests.RequestException as e:
             log.warning("probe %s failed: %s", url, e)
     return None
@@ -337,12 +358,15 @@ def download_ecmwf_ens(run: dt.datetime, step: int, fields, dest: Path, retries:
     raise RuntimeError(f"Failed to download ECMWF ENS step {step}")
 
 
-def load_grib_members(path: Path, tag: str = "") -> dict:
+def load_grib_members(path: Path, tag: str = "", bbox=None) -> dict:
     """Like load_grib, but splits messages by ensemble member:
-    {"c00": Fields, "p01": Fields, ...}. Control = perturbationNumber 0."""
+    {"c00": Fields, "p01": Fields, ...}. Control = perturbationNumber 0.
+    With bbox, every field is cropped as it's read (global 51-member files
+    would otherwise need ~3 GB of memory) and stored as float32."""
     import eccodes as ec
     out: dict = {}
     coords = {}
+    sel = None
     with open(path, "rb") as fh:
         while True:
             h = ec.codes_grib_new_from_file(fh)
@@ -372,15 +396,26 @@ def load_grib_members(path: Path, tag: str = "") -> dict:
                 vals = ec.codes_get_values(h).reshape(nj, ni)
                 if not coords:
                     lats = ec.codes_get_array(h, "latitudes").reshape(nj, ni); lons = ec.codes_get_array(h, "longitudes").reshape(nj, ni)
-                    coords = {"lat": lats[:, 0].copy(), "lon": lons[0, :].copy()}
+                    lat0, lon0 = lats[:, 0].copy(), lons[0, :].copy()
+                    lon180 = np.where(lon0 > 180, lon0 - 360, lon0)
+                    if bbox is not None:
+                        blon0, blon1, blat0, blat1 = bbox
+                        li = np.where((lon180 >= blon0) & (lon180 <= blon1))[0]
+                        la = np.where((lat0 >= blat0) & (lat0 <= blat1))[0]
+                        sel = (la, li)
+                        coords = {"lat": lat0[la], "lon": lon180[li]}
+                    else:
+                        coords = {"lat": lat0, "lon": lon180}
+                if sel is not None:
+                    vals = vals[np.ix_(*sel)]
                 f = out.setdefault(mem, Fields())
                 if key not in f:
-                    f[key] = np.asarray(vals, dtype=float)
+                    f[key] = np.asarray(vals, dtype=np.float32)
             finally:
                 ec.codes_release(h)
     if not out:
         raise RuntimeError(f"No data in {path}")
-    lon = np.where(coords["lon"] > 180, coords["lon"] - 360, coords["lon"]); order = np.argsort(lon); lon = lon[order]
+    lon = coords["lon"]; order = np.argsort(lon); lon = lon[order]
     lat = coords["lat"]; flip = lat[0] < lat[-1]
     for f in out.values():
         for k in list(f):
@@ -634,6 +669,22 @@ def download_files(run: dt.datetime, step: int, pairs: set, dest: Path, session:
         icon_remap(raw, dest); raw.unlink()
     else:
         raw.rename(dest)
+    return dest
+
+
+def pack_members(path: Path, prev_path, bbox, dest: Path) -> Path:
+    """Read a multi-member GRIB (plus optional previous-step file) once, cropped
+    to bbox, and save a compact .npz that workers can load cheaply."""
+    per = load_grib_members(path, bbox=bbox)
+    if prev_path:
+        for m, pf in load_grib_members(Path(prev_path), "_m6", bbox=bbox).items():
+            if m in per:
+                per[m].update(pf)
+    members = sorted(per)
+    keys = sorted(set.intersection(*(set(per[m]) for m in members)))
+    arrays = {k: np.stack([per[m][k] for m in members]).astype(np.float32) for k in keys}
+    any_f = per[members[0]]
+    np.savez(dest, lon=any_f.lon, lat=any_f.lat, members=np.array(members), keys=np.array(keys), **arrays)
     return dest
 
 
